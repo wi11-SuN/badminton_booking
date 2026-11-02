@@ -1,0 +1,19 @@
+{
+  "venue_id": "3302000102",
+  "venue_name": "综合馆",
+  "service_id": "1002",
+  "field_type_priority": ["842", "843", "2434", "2440"],
+  "start_time": "19:00",
+  "end_time": "21:00",
+  "release_weekday": 3,
+  "release_time": "08:00:00",
+  "target_days_after_release": 6,
+  "catch_up_seconds": 180,
+  "warmup_seconds": 20,
+  "poll_interval_seconds": 1,
+  "max_wait_seconds": 30,
+  "max_commit_attempts": 3,
+  "http_timeout_seconds": 8,
+  "runtime_dir": null,
+  "reqable_mcp_path": "D:\\Reqable\\mcp-server.exe"
+}
