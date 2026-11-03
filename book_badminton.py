@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from contextlib import contextmanager
 import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -100,6 +101,14 @@ def load_config(path):
     if not .1 <= cfg["candidate_ttl_seconds"] <= 30:
         raise BookingError("候选缓存有效期应为 0.1–30 秒")
     cfg["field_type_priority"] = list(dict.fromkeys(str(x) for x in cfg["field_type_priority"]))
+    anchor = cfg.get("anchor_court")
+    if anchor is not None:
+        if not isinstance(anchor, dict) or not all(re.fullmatch(r"[0-9]+", str(anchor.get(k, "")))
+                                                  for k in ("field_type", "field_id")):
+            raise BookingError("anchor_court 需要数字形式的 field_type 和 field_id")
+        anchor["field_type"], anchor["field_id"] = str(anchor["field_type"]), str(anchor["field_id"])
+        if anchor["field_type"] not in cfg["field_type_priority"]:
+            raise BookingError("首选场地类型必须属于允许查询的 field_type_priority")
     cfg["venue_id"], cfg["service_id"] = str(cfg["venue_id"]), str(cfg["service_id"])
     return cfg
 
@@ -335,9 +344,10 @@ def probe(client, cfg):
     query = urllib.parse.urlencode({"venueId": cfg["venue_id"], "serviceId": cfg["service_id"], "date": now().strftime("%Y%m%d")})
     data = client.get_json(ROOT+"/field/fieldTypes?"+query)
     available = {str(x["fieldType"]): x["fieldTypeName"] for x in data.get("fieldTypeList", [])}
-    if not any(k in available for k in cfg["field_type_priority"]):
+    configured = {k: available[k] for k in cfg["field_type_priority"] if k in available}
+    if not configured:
         raise BookingError("没有找到配置中的场地类型，请核对场馆配置")
-    return available
+    return configured
 
 
 def court_path(cfg, kind, date):
@@ -362,6 +372,12 @@ def scan_kind(client, cfg, date, kind):
     return [(kind, payload_for(cfg, date, kind, slots), client, path) for slots in choices]
 
 
+def matches_anchor(cfg, kind, payload):
+    anchor = cfg.get("anchor_court")
+    return bool(anchor and kind == anchor["field_type"] and
+                payload["fieldInfoList"][0]["fieldId"] == anchor["field_id"])
+
+
 def gather(clients, cfg, date):
     """仅供 dry-run 完整展示；正式预约使用逐批消费的 CandidateFeed。"""
     results, reasons = {}, []
@@ -376,6 +392,7 @@ def gather(clients, cfg, date):
             except Exception as exc:
                 reasons.append(f"{kind}: {safe_message(exc)}")
     candidates = [candidate for kind in cfg["field_type_priority"] for candidate in results.get(kind, [])]
+    candidates.sort(key=lambda c: not matches_anchor(cfg, c[0], c[1]))
     return candidates, reasons
 
 
@@ -409,6 +426,8 @@ class CandidateFeed:
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(self.kinds)))
         self.pending, self.batches, self.reasons = {}, {}, {}
         self.next_scan = dict.fromkeys(self.kinds, 0.0)
+        self.last_scan = {}
+        self.await_anchor = bool(cfg.get("anchor_court"))
         self.blocked, self.closed = set(), False
 
     def _scan(self, kind):
@@ -436,10 +455,23 @@ class CandidateFeed:
                     self.blocked.add(kind)
                 LOG.info("查询无可用结果 类型=%s 原因=%s", kind, safe_message(exc))
             self.next_scan[kind] = finished + self.cfg["poll_interval_seconds"]
+            self.last_scan[kind] = finished
 
     def fresh(self, candidate):
         # 这是本地缓存保留时间，不代表服务器快照的真实生成时间。
         return time.monotonic() - candidate.query_finished <= self.ttl
+
+    def start_queries(self, kinds=None):
+        current = time.monotonic()
+        running = set(self.pending.values())
+        if kinds is None:
+            kinds = self.kinds
+        for kind in kinds:
+            if (current < self.deadline and kind not in running and kind not in self.blocked
+                    and self.next_scan[kind] <= current):
+                self.pending[self.pool.submit(self._scan, kind)] = kind
+                running.add(kind)
+        return running
 
     def next_candidate(self, tried):
         while not self.closed and time.monotonic() < self.deadline:
@@ -447,25 +479,35 @@ class CandidateFeed:
             for kind in self.kinds:
                 batch = self.batches.get(kind, [])
                 self.batches[kind] = [c for c in batch if c.key not in tried and self.fresh(c)]
-            # 只在已返回的结果之间按配置排序；不等待尚未完成的高优先级查询。
-            for kind in self.kinds:
-                if self.batches[kind]:
-                    return self.batches[kind].pop(0)
             current = time.monotonic()
             if current >= self.deadline:
                 break
-            running = set(self.pending.values())
-            for kind in self.kinds:
-                if kind not in running and kind not in self.blocked and self.next_scan[kind] <= current:
-                    self.pending[self.pool.submit(self._scan, kind)] = kind
-                    running.add(kind)
+            waiting_for = None
+            if self.await_anchor and not tried:
+                kind = self.cfg["anchor_court"]["field_type"]
+                # 首个 POST 前先看首选类型。规则倒计时使其过期时，等待新的结果。
+                if kind not in self.reasons and (kind not in self.last_scan or current-self.last_scan[kind] > self.ttl):
+                    waiting_for = kind
+                else:
+                    for i, candidate in enumerate(self.batches[kind]):
+                        if matches_anchor(self.cfg, kind, candidate.payload):
+                            return self.batches[kind].pop(i)
+                    self.await_anchor = False
+                    LOG.info("本次查询未取得可订的首选场地，开始选择允许范围内的备选")
+            if waiting_for is None:
+                for kind in self.kinds:
+                    if self.batches[kind]:
+                        return self.batches[kind].pop(0)
+            kinds = [waiting_for] if waiting_for else self.kinds
+            running = self.start_queries(kinds)
             if not self.pending and len(self.blocked) == len(self.kinds):
                 break
-            wake_at = min([self.deadline] + [self.next_scan[k] for k in self.kinds
+            wake_at = min([self.deadline] + [self.next_scan[k] for k in kinds
                           if k not in running and k not in self.blocked])
             timeout = max(0, wake_at-time.monotonic())
-            if self.pending:
-                concurrent.futures.wait(self.pending, timeout=timeout,
+            jobs = [f for f, k in self.pending.items() if k in kinds]
+            if jobs:
+                concurrent.futures.wait(jobs, timeout=timeout,
                                         return_when=concurrent.futures.FIRST_COMPLETED)
             elif timeout:
                 time.sleep(timeout)
@@ -636,7 +678,7 @@ def prepare(cfg, runtime):
         raise
 
 
-def book(cfg, runtime, date, dry=False, prepared=None, release=None):
+def book(cfg, runtime, date, dry=False, prepared=None, release=None, prepared_anchor=None):
     started = time.monotonic()
     release_started = started-(now()-release).total_seconds() if release is not None else None
     clients = prepared.get("clients", {}) if prepared else {}
@@ -649,7 +691,9 @@ def book(cfg, runtime, date, dry=False, prepared=None, release=None):
             clients = {kind: Client(session, cfg) for kind in cfg["field_type_priority"]}
             probe(clients[cfg["field_type_priority"][0]], cfg)
             candidates, reasons = gather(clients, cfg, date)
-            plans = [{"field_type": k, "court": p["fieldInfoList"][0]["venueName"], "preview_yuan": p["fieldInfoList"][0]["price"]} for k, p, c, r in candidates]
+            plans = [{"field_type": k, "court": p["fieldInfoList"][0]["venueName"],
+                      "field_id": p["fieldInfoList"][0]["fieldId"], "is_anchor": matches_anchor(cfg, k, p),
+                      "preview_yuan": p["fieldInfoList"][0]["price"]} for k, p, c, r in candidates]
             print(json.dumps({"date": date.isoformat(), "time": cfg["start_time"]+"–"+cfg["end_time"], "candidates": plans, "notes": reasons, "submitted": False}, ensure_ascii=False, indent=2))
             return None
         prepared = prepared or prepare(cfg, runtime)
@@ -657,12 +701,23 @@ def book(cfg, runtime, date, dry=False, prepared=None, release=None):
         clients = prepared["clients"]
         deadline = time.monotonic()+cfg["max_wait_seconds"]
         feed = CandidateFeed(clients, cfg, date, deadline)
+        feed.start_queries()
+        if prepared_anchor is not None:
+            payload = prepared_anchor.payload
+            kind = prepared_anchor.kind
+            if not (kind in feed.kinds and matches_anchor(cfg, kind, payload) and
+                    payload["fieldType"] == kind and payload["venueId"] == cfg["venue_id"] and
+                    payload["serviceId"] == cfg["service_id"] and payload["day"] == date.strftime("%Y%m%d") and
+                    prepared_anchor.key[3:] == (str(half_hour(cfg["start_time"])), str(half_hour(cfg["end_time"]))) and
+                    feed.fresh(prepared_anchor)):
+                prepared_anchor = None
         journal = {"state": "preparing", "date": date.isoformat(), "start_time": cfg["start_time"],
                    "end_time": cfg["end_time"], "attempts": []}
         path, acquired, tried = state_path(runtime, cfg, date), False, set()
         delay_ready = False
         while time.monotonic() < deadline:
-            candidate = feed.next_candidate(tried)
+            candidate = prepared_anchor or feed.next_candidate(tried)
+            prepared_anchor = None
             if candidate is None:
                 break
             if not delay_ready:
@@ -803,10 +858,63 @@ def refresh_session(cfg, runtime):
 
 def show_plan(cfg):
     release = next_release(now(), cfg)
+    anchor = cfg.get("anchor_court")
+    preference = (f"首选：{anchor.get('name') or anchor['field_id']}（类型 {anchor['field_type']}，场地 ID {anchor['field_id']}）\n"
+                  if anchor else "")
     print(f"北京时间：{now():%Y-%m-%d %H:%M:%S}\n下次放号：{release:%Y-%m-%d %A %H:%M:%S}\n"
           f"目标日期：{target_date(release, cfg)}\n时段：{cfg['start_time']}–{cfg['end_time']}，同一片连续场地\n"
-          f"场馆：{cfg['venue_name']}；已返回结果的类型优先顺序：{', '.join(cfg['field_type_priority'])}\n"
+          f"{preference}场馆：{cfg['venue_name']}；允许查询的类型（备选优先顺序）：{', '.join(cfg['field_type_priority'])}\n"
           "当前只显示计划，没有预约或下单。")
+
+
+def wait_until(moment):
+    while (remaining := (moment-now()).total_seconds()) > 0:
+        time.sleep(min(.2, remaining))
+
+
+@contextmanager
+def anchor_at_release(cfg, prepared, date, release):
+    """等到放票，只借出已完成的目标日首选；慢查询用独立连接收尾。"""
+    pool, job, client = None, None, None
+    ttl = cfg.get("candidate_ttl_seconds", 2)
+    anchor = cfg.get("anchor_court")
+    try:
+        if prepared and anchor:
+            wait_until(release-dt.timedelta(seconds=min(1, ttl/2)))
+            if now() < release:
+                kind = anchor["field_type"]
+                def preview():
+                    started = time.monotonic()
+                    choices = scan_kind(client, cfg, date, kind)
+                    finished = time.monotonic()
+                    return next((Candidate(*c, started, finished) for c in choices
+                                 if matches_anchor(cfg, c[0], c[1])), None)
+                try:
+                    session = dict(prepared["session"], cookies=prepared["clients"][kind].cookies)
+                    client = Client(session, cfg)
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    job = pool.submit(preview)
+                except Exception as exc:
+                    LOG.info("首选预读未启动，到点查询：%s", safe_message(exc))
+        wait_until(release)
+        candidate = None
+        if job is not None and job.done():
+            try:
+                candidate = job.result()
+                if candidate and time.monotonic()-candidate.query_finished > ttl:
+                    candidate = None
+            except Exception as exc:
+                LOG.info("首选预读未取得有效候选：%s", safe_message(exc))
+        if job is not None:
+            LOG.info("采用放票前查到的首选场次" if candidate else "放票时重新查询首选场次")
+        yield candidate
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        if job is not None:
+            job.add_done_callback(lambda _: client.close())
+        elif client is not None:
+            client.close()
 
 
 def schedule(cfg, runtime):
@@ -826,10 +934,9 @@ def schedule(cfg, runtime):
             LOG.error("放号前检查失败：%s", safe_message(exc))
             notify()
         try:
-            while now() < release:
-                time.sleep(min(.2, max(.001, (release-now()).total_seconds())))
-            booking_prepared, prepared = prepared, None  # 连接的关闭责任转交 book。
-            book(cfg, runtime, date, prepared=booking_prepared, release=release)
+            with anchor_at_release(cfg, prepared, date, release) as anchor:
+                booking_prepared, prepared = prepared, None  # 连接的关闭责任转交 book。
+                book(cfg, runtime, date, prepared=booking_prepared, release=release, prepared_anchor=anchor)
         except Exception as exc:
             LOG.error("本周预约结束：%s", safe_message(exc))
             notify()
