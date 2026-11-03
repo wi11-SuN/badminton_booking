@@ -11,6 +11,7 @@
   "catch_up_seconds": 180,
   "warmup_seconds": 20,
   "poll_interval_seconds": 1,
+  "candidate_ttl_seconds": 2,
   "max_wait_seconds": 30,
   "max_commit_attempts": 3,
   "http_timeout_seconds": 8,

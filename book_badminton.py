@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import getpass
 from html import unescape
 from html.parser import HTMLParser
+import http.client
 from http.cookies import SimpleCookie
 import json
 import logging
@@ -19,9 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 TZ = dt.timezone(dt.timedelta(hours=8), "Asia/Shanghai")
 ORIGIN = "https://webssl.xports.cn"
@@ -96,7 +96,10 @@ def load_config(path):
         raise BookingError("请求超时应为 1–30 秒")
     if not cfg["field_type_priority"]:
         raise BookingError("需要至少一个场地类型")
-    cfg["field_type_priority"] = [str(x) for x in cfg["field_type_priority"]]
+    cfg.setdefault("candidate_ttl_seconds", 2)
+    if not .1 <= cfg["candidate_ttl_seconds"] <= 30:
+        raise BookingError("候选缓存有效期应为 0.1–30 秒")
+    cfg["field_type_priority"] = list(dict.fromkeys(str(x) for x in cfg["field_type_priority"]))
     cfg["venue_id"], cfg["service_id"] = str(cfg["venue_id"]), str(cfg["service_id"])
     return cfg
 
@@ -110,44 +113,82 @@ def runtime_path(args, cfg):
     return Path(os.environ.get("XDG_STATE_HOME", str(Path.home()/".local"/"state"))) / "badminton-booking"
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # 不将本站 Cookie 随重定向转发至其他站点。
-
-
 class Client:
     def __init__(self, session, cfg):
         self.cookies = dict(session["cookies"])
         self.agent = session.get("user_agent") or "Python BadmintonBooking/1.0"
         self.timeout = cfg["http_timeout_seconds"]
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        self._connection = None
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def _disconnect(self):
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def close(self):
+        # 由使用者在后台查询完成后调用；不会中断已经发送的提交。
+        with self._lock:
+            self._closed = True
+            self._disconnect()
 
     def request(self, path, payload=None, referer=None):
         if not path.startswith(ROOT + "/") or "\r" in path or "\n" in path:
             raise BookingError("拒绝非场馆路径")
-        headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in self.cookies.items()),
-                   "User-Agent": self.agent, "Accept": "application/json,text/html;q=0.9",
-                   "X-Requested-With": "XMLHttpRequest",
-                   "Referer": ORIGIN + (referer or ROOT+"/venue/venueQueryList?key=&serviceId=1002")}
-        data = None
-        if payload is not None:
-            headers.update({"Content-Type": "application/json", "Origin": ORIGIN})
-            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        req = urllib.request.Request(ORIGIN+path, headers=headers, data=data,
-                                     method="POST" if payload is not None else "GET")
-        try:
-            response = self.opener.open(req, timeout=self.timeout)
-        except urllib.error.HTTPError as exc:
-            response = exc
-        for value in response.headers.get_all("Set-Cookie", []):
-            cookie = SimpleCookie()
-            cookie.load(value)
-            for key, item in cookie.items():
-                self.cookies[key] = item.value
-        raw = response.read(5_000_001)
-        if len(raw) > 5_000_000:
-            raise BookingError("响应过大，停止处理")
-        return response.code, raw.decode("utf-8", errors="replace")
+        if referer is not None and (not referer.startswith(ROOT + "/") or "\r" in referer or "\n" in referer):
+            raise BookingError("拒绝非场馆来源路径")
+        method = "POST" if payload is not None else "GET"
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        with self._lock:
+            if self._closed:
+                raise BookingError("网络客户端已关闭")
+            started, status = time.monotonic(), None
+            reused = self._connection is not None
+            try:
+                for attempt in range(2):
+                    response = None
+                    try:
+                        if self._connection is None:
+                            origin = urllib.parse.urlsplit(ORIGIN)
+                            # 固定 HTTPS 主机；不读取环境代理，也不自动跟随重定向。
+                            self._connection = http.client.HTTPSConnection(origin.hostname, origin.port, timeout=self.timeout)
+                        headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in self.cookies.items()),
+                                   "User-Agent": self.agent, "Accept": "application/json,text/html;q=0.9",
+                                   "X-Requested-With": "XMLHttpRequest",
+                                   "Referer": ORIGIN + (referer or ROOT+"/venue/venueQueryList?key=&serviceId=1002")}
+                        if payload is not None:
+                            headers.update({"Content-Type": "application/json", "Origin": ORIGIN})
+                        self._connection.request(method, path, body=data, headers=headers)
+                        response = self._connection.getresponse()
+                        status = response.status
+                        for value in response.headers.get_all("Set-Cookie", []):
+                            cookie = SimpleCookie()
+                            cookie.load(value)
+                            for key, item in cookie.items():
+                                self.cookies[key] = item.value
+                        raw = response.read(5_000_001)
+                        if len(raw) > 5_000_000:
+                            raise BookingError("响应过大，停止处理")
+                        if response.length:
+                            raise http.client.IncompleteRead(raw, response.length)
+                        return status, raw.decode("utf-8", errors="replace")
+                    except (http.client.RemoteDisconnected, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                            http.client.CannotSendRequest, http.client.ResponseNotReady):
+                        self._disconnect()
+                        # 只重试已复用连接上的只读请求。提交即便断连也绝不自动重发。
+                        if method != "GET" or not reused or attempt:
+                            raise
+                        LOG.info("只读请求复用连接已断开，重连一次：%s", path.split("?", 1)[0])
+                    except BaseException:
+                        self._disconnect()
+                        raise
+                    finally:
+                        if response is not None:
+                            response.close()
+            finally:
+                LOG.info("HTTP %s %s status=%s elapsed_ms=%.1f", method, path.split("?", 1)[0],
+                         status if status is not None else "unknown", (time.monotonic()-started)*1000)
 
     def get_json(self, path):
         status, body = self.request(path)
@@ -304,8 +345,7 @@ def court_path(cfg, kind, date):
     return ROOT+f'/court/{cfg["venue_id"]}/{cfg["service_id"]}/{kind}/{date:%Y%m%d}?'+query
 
 
-def scan_kind(session, cfg, date, kind):
-    client = Client(session, cfg)
+def scan_kind(client, cfg, date, kind):
     path = court_path(cfg, kind, date)
     status, text = client.request(path)
     if "未查询到公众号信息" in text:
@@ -322,10 +362,11 @@ def scan_kind(session, cfg, date, kind):
     return [(kind, payload_for(cfg, date, kind, slots), client, path) for slots in choices]
 
 
-def gather(session, cfg, date):
+def gather(clients, cfg, date):
+    """仅供 dry-run 完整展示；正式预约使用逐批消费的 CandidateFeed。"""
     results, reasons = {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(cfg["field_type_priority"]))) as pool:
-        jobs = {pool.submit(scan_kind, session, cfg, date, kind): kind for kind in cfg["field_type_priority"]}
+        jobs = {pool.submit(scan_kind, clients[kind], cfg, date, kind): kind for kind in cfg["field_type_priority"]}
         for future in concurrent.futures.as_completed(jobs):
             kind = jobs[future]
             try:
@@ -336,6 +377,112 @@ def gather(session, cfg, date):
                 reasons.append(f"{kind}: {safe_message(exc)}")
     candidates = [candidate for kind in cfg["field_type_priority"] for candidate in results.get(kind, [])]
     return candidates, reasons
+
+
+@dataclass(frozen=True)
+class Candidate:
+    kind: str
+    payload: dict
+    client: Client
+    referer: str
+    query_started: float
+    query_finished: float
+
+    @property
+    def key(self):
+        field = self.payload["fieldInfoList"][0]
+        return (self.payload["day"], self.kind, field["fieldId"],
+                field["startSegment"], field["endSegment"])
+
+
+def close_clients(clients):
+    for client in clients.values():
+        client.close()
+
+
+class CandidateFeed:
+    """后台只查询，主线程独占候选选择和提交；每类最多一个查询。"""
+    def __init__(self, clients, cfg, date, deadline):
+        self.clients, self.cfg, self.date, self.deadline = clients, cfg, date, deadline
+        self.kinds = cfg["field_type_priority"]
+        self.ttl = cfg.get("candidate_ttl_seconds", 2)
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(self.kinds)))
+        self.pending, self.batches, self.reasons = {}, {}, {}
+        self.next_scan = dict.fromkeys(self.kinds, 0.0)
+        self.blocked, self.closed = set(), False
+
+    def _scan(self, kind):
+        started = time.monotonic()
+        choices = scan_kind(self.clients[kind], self.cfg, self.date, kind)
+        finished = time.monotonic()
+        LOG.info("查询完成 类型=%s 候选=%d 耗时=%.1fms", kind, len(choices), (finished-started)*1000)
+        return [Candidate(*choice, started, finished) for choice in choices], finished
+
+    def _harvest(self):
+        for future, kind in list(self.pending.items()):
+            if not future.done():
+                continue
+            del self.pending[future]
+            try:
+                self.batches[kind], finished = future.result()
+                self.reasons.pop(kind, None)
+            except SessionExpired:
+                raise
+            except Exception as exc:
+                finished = time.monotonic()
+                self.batches[kind] = []
+                self.reasons[kind] = safe_message(exc)
+                if isinstance(exc, NeedsHuman):
+                    self.blocked.add(kind)
+                LOG.info("查询无可用结果 类型=%s 原因=%s", kind, safe_message(exc))
+            self.next_scan[kind] = finished + self.cfg["poll_interval_seconds"]
+
+    def fresh(self, candidate):
+        # 这是本地缓存保留时间，不代表服务器快照的真实生成时间。
+        return time.monotonic() - candidate.query_finished <= self.ttl
+
+    def next_candidate(self, tried):
+        while not self.closed and time.monotonic() < self.deadline:
+            self._harvest()
+            for kind in self.kinds:
+                batch = self.batches.get(kind, [])
+                self.batches[kind] = [c for c in batch if c.key not in tried and self.fresh(c)]
+            # 只在已返回的结果之间按配置排序；不等待尚未完成的高优先级查询。
+            for kind in self.kinds:
+                if self.batches[kind]:
+                    return self.batches[kind].pop(0)
+            current = time.monotonic()
+            if current >= self.deadline:
+                break
+            running = set(self.pending.values())
+            for kind in self.kinds:
+                if kind not in running and kind not in self.blocked and self.next_scan[kind] <= current:
+                    self.pending[self.pool.submit(self._scan, kind)] = kind
+                    running.add(kind)
+            if not self.pending and len(self.blocked) == len(self.kinds):
+                break
+            wake_at = min([self.deadline] + [self.next_scan[k] for k in self.kinds
+                          if k not in running and k not in self.blocked])
+            timeout = max(0, wake_at-time.monotonic())
+            if self.pending:
+                concurrent.futures.wait(self.pending, timeout=timeout,
+                                        return_when=concurrent.futures.FIRST_COMPLETED)
+            elif timeout:
+                time.sleep(timeout)
+        return None
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        # 不用 with executor：成功返回不能被仍在进行的只读查询拖住。
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        busy = {kind: future for future, kind in self.pending.items()}
+        for kind, client in self.clients.items():
+            if kind in busy:
+                busy[kind].add_done_callback(lambda future, client=client: client.close())
+            else:
+                client.close()
 
 
 def state_path(runtime, cfg, date):
@@ -368,13 +515,35 @@ def result_summary(data, payload):
             "date": payload["day"], "preview_yuan": payload["fieldInfoList"][0]["price"]}
 
 
-def commit_once(client, payload, referer, journal, path):
+def commit_once(client, payload, referer, journal, path, timing=None):
     journal["state"] = "sending"
     journal["attempts"].append({"at": now().isoformat(), "field_type": payload["fieldType"],
                                  "court": payload["fieldInfoList"][0]["venueName"], "field_info": payload["fieldInfo"]})
     atomic_json(path, journal)  # 网络发送前落盘；崩溃和超时不会被当成未提交。
     try:
-        status, body = client.request(ROOT+"/court/commit", payload, referer)
+        attempt = journal["attempts"][-1]
+        sent = time.monotonic()
+        if timing and sent >= timing.get("deadline", float("inf")):
+            journal.update(state="not_sent", message="预约窗口已结束，未发送本次请求")
+            attempt["outcome"] = "not_sent"
+            atomic_json(path, journal)
+            raise BookingError(journal["message"])
+        metrics = attempt["timing_ms"] = {}
+        attempt["sent_at"] = now().isoformat(timespec="milliseconds")
+        if timing:
+            metrics.update(run_to_send=round((sent-timing["run_started"])*1000, 1),
+                           query=round((timing["query_finished"]-timing["query_started"])*1000, 1),
+                           candidate_age=round((sent-timing["query_finished"])*1000, 1),
+                           query_start_to_send=round((sent-timing["query_started"])*1000, 1))
+            if timing.get("release_started") is not None:
+                metrics["release_to_send"] = round((sent-timing["release_started"])*1000, 1)
+        LOG.info("提交开始 第%d次 timing_ms=%s", len(journal["attempts"]), metrics)
+        try:
+            status, body = client.request(ROOT+"/court/commit", payload, referer)
+            attempt["http_status"] = status
+        finally:
+            metrics["commit"] = round((time.monotonic()-sent)*1000, 1)
+            LOG.info("提交请求结束 第%d次 耗时=%.1fms", len(journal["attempts"]), metrics["commit"])
         if status != 200:
             raise UnknownResult(f"提交返回 HTTP {status}，结果未知，请先查手机订单")
         try:
@@ -383,6 +552,7 @@ def commit_once(client, payload, referer, journal, path):
             raise UnknownResult("提交返回非 JSON，结果未知，请先查手机订单") from None
         if not isinstance(data, dict) or "error" not in data:
             raise UnknownResult("提交响应格式改变，结果未知，请先查手机订单")
+        attempt["business_code"] = data["error"]
         if data["error"] == 0:
             if not data.get("tradeId"):
                 raise UnknownResult("提交成功但缺少订单号，请查手机订单")
@@ -443,47 +613,80 @@ def honor_delay(rules):
 
 
 def prepare(cfg, runtime):
+    started = time.monotonic()
     session = load_session(runtime)
     client = Client(session, cfg)
-    probe(client, cfg)
-    rules = booking_rules(client, cfg)
-    session = dict(session, cookies=dict(client.cookies))
-    return {"session": session, "rules": rules}
+    clients = {cfg["field_type_priority"][0]: client}
+    try:
+        probe(client, cfg)
+        rules = booking_rules(client, cfg)
+        session = dict(session, cookies=dict(client.cookies))
+        for kind in cfg["field_type_priority"][1:]:
+            clients[kind] = Client(session, cfg)
+        # 各类型保留自己的连接及 Cookie；预热只访问只读接口。
+        if len(clients) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(clients)-1)) as pool:
+                jobs = [pool.submit(probe, clients[k], cfg) for k in cfg["field_type_priority"][1:]]
+                for future in concurrent.futures.as_completed(jobs):
+                    future.result()
+        LOG.info("会话、规则及%d条连接预热完成 耗时=%.1fms", len(clients), (time.monotonic()-started)*1000)
+        return {"session": session, "rules": rules, "clients": clients}
+    except BaseException:
+        close_clients(clients)
+        raise
 
 
-def book(cfg, runtime, date, dry=False, prepared=None):
-    if not dry and state_path(runtime, cfg, date).exists():
-        raise AlreadyAttempted("该日期时段已有提交记录，不会重复创建；请用 status 或手机查单")
-    if dry:
-        session = load_session(runtime)
-        probe(Client(session, cfg), cfg)
-        rules = {}
-    else:
-        prepared = prepared or prepare(cfg, runtime)
-        session, rules = prepared["session"], prepared["rules"]
-    deadline = time.monotonic()+(0 if dry else cfg["max_wait_seconds"])
-    journal = {"state": "preparing", "date": date.isoformat(), "start_time": cfg["start_time"],
-               "end_time": cfg["end_time"], "attempts": []}
-    path, acquired, tried, last_reasons = state_path(runtime, cfg, date), False, set(), []
-    while True:
-        candidates, reasons = gather(session, cfg, date)
-        last_reasons = reasons
+def book(cfg, runtime, date, dry=False, prepared=None, release=None):
+    started = time.monotonic()
+    release_started = started-(now()-release).total_seconds() if release is not None else None
+    clients = prepared.get("clients", {}) if prepared else {}
+    feed = None
+    try:
+        if not dry and state_path(runtime, cfg, date).exists():
+            raise AlreadyAttempted("该日期时段已有提交记录，不会重复创建；请用 status 或手机查单")
         if dry:
+            session = load_session(runtime)
+            clients = {kind: Client(session, cfg) for kind in cfg["field_type_priority"]}
+            probe(clients[cfg["field_type_priority"][0]], cfg)
+            candidates, reasons = gather(clients, cfg, date)
             plans = [{"field_type": k, "court": p["fieldInfoList"][0]["venueName"], "preview_yuan": p["fieldInfoList"][0]["price"]} for k, p, c, r in candidates]
             print(json.dumps({"date": date.isoformat(), "time": cfg["start_time"]+"–"+cfg["end_time"], "candidates": plans, "notes": reasons, "submitted": False}, ensure_ascii=False, indent=2))
             return None
-        candidate = next((c for c in candidates if c[1]["fieldInfo"] not in tried), None)
-        if candidate:
+        prepared = prepared or prepare(cfg, runtime)
+        rules = prepared["rules"]
+        clients = prepared["clients"]
+        deadline = time.monotonic()+cfg["max_wait_seconds"]
+        feed = CandidateFeed(clients, cfg, date, deadline)
+        journal = {"state": "preparing", "date": date.isoformat(), "start_time": cfg["start_time"],
+                   "end_time": cfg["end_time"], "attempts": []}
+        path, acquired, tried = state_path(runtime, cfg, date), False, set()
+        delay_ready = False
+        while time.monotonic() < deadline:
+            candidate = feed.next_candidate(tried)
+            if candidate is None:
+                break
+            if not delay_ready:
+                honor_delay(rules)
+                delay_ready = True
+            if time.monotonic() >= deadline:
+                break
+            if not feed.fresh(candidate):
+                LOG.info("候选在规则等待后过期，重新查询 类型=%s", candidate.kind)
+                continue
             if not acquired:
                 acquire_state(path, journal)
                 acquired = True
-            kind, payload, candidate_client, referer = candidate
-            tried.add(payload["fieldInfo"])
+            kind, payload = candidate.kind, candidate.payload
+            tried.add(candidate.key)
             LOG.info("提交 %s %s %s %s–%s；预览 %.2f 元（最终金额以服务器为准）", date, kind,
                      payload["fieldInfoList"][0]["venueName"], cfg["start_time"], cfg["end_time"], payload["fieldInfoList"][0]["price"])
-            honor_delay(rules)
+            delay_ready = False
             try:
-                result = commit_once(candidate_client, payload, referer, journal, path)
+                result = commit_once(candidate.client, payload, candidate.referer, journal, path,
+                                     timing={"run_started": started, "release_started": release_started,
+                                             "deadline": deadline,
+                                             "query_started": candidate.query_started,
+                                             "query_finished": candidate.query_finished})
                 LOG.info("已创建订单 %s，应付 %s 元，截止 %s，创建时支付状态 %s（0=未支付）。请在手机核对。",
                          result["trade_id"], result["pay_fee_yuan"], result["expires_at"], result["pay_state_at_creation"])
                 notify()
@@ -493,9 +696,14 @@ def book(cfg, runtime, date, dry=False, prepared=None):
                 LOG.warning("%s", safe_message(exc))
                 if len(journal["attempts"]) >= cfg["max_commit_attempts"]:
                     raise BookingError("明确库存冲突已达到本次提交次数上限") from None
-        if time.monotonic() >= deadline:
-            raise NotAvailable("窗口内未找到目标同场连续时段。" + "；".join(last_reasons))
-        time.sleep(min(cfg["poll_interval_seconds"], max(0, deadline-time.monotonic())))
+                # 不睡眠、不强制重扫：下一轮直接消费足够新的缓存备选。
+        reasons = "；".join(f"{k}: {v}" for k, v in feed.reasons.items())
+        raise NotAvailable("窗口内未找到目标同场连续时段。" + reasons)
+    finally:
+        if feed is not None:
+            feed.close()
+        else:
+            close_clients(clients)
 
 
 def notify():
@@ -579,7 +787,12 @@ def refresh_session(cfg, runtime):
             if cookies.get("JSESSIONID"):
                 session = {"cookies": cookies, "user_agent": agent, "saved_at": now().isoformat(),
                            "capture_id": rid, "captured_at": record.get("connection", {}).get("timestamp")}
-                probe(Client(session, cfg), cfg)  # 先验证，再替换原会话。
+                client = Client(session, cfg)
+                try:
+                    probe(client, cfg)  # 先验证，再替换原会话。
+                    session["cookies"] = dict(client.cookies)
+                finally:
+                    client.close()
                 atomic_json(runtime/"session.json", session)
                 LOG.info("会话已更新（抓包记录 %s）；仅验证读取有效，未提交订单。", rid)
                 return
@@ -592,7 +805,7 @@ def show_plan(cfg):
     release = next_release(now(), cfg)
     print(f"北京时间：{now():%Y-%m-%d %H:%M:%S}\n下次放号：{release:%Y-%m-%d %A %H:%M:%S}\n"
           f"目标日期：{target_date(release, cfg)}\n时段：{cfg['start_time']}–{cfg['end_time']}，同一片连续场地\n"
-          f"场馆：{cfg['venue_name']}；类型优先顺序：{', '.join(cfg['field_type_priority'])}\n"
+          f"场馆：{cfg['venue_name']}；已返回结果的类型优先顺序：{', '.join(cfg['field_type_priority'])}\n"
           "当前只显示计划，没有预约或下单。")
 
 
@@ -608,17 +821,21 @@ def schedule(cfg, runtime):
         prepared = None
         try:
             prepared = prepare(cfg, runtime)
-            LOG.info("放号前会话和场馆规则预读通过。")
+            LOG.info("放号前会话、场馆规则及连接预热通过。")
         except Exception as exc:
             LOG.error("放号前检查失败：%s", safe_message(exc))
             notify()
-        while now() < release:
-            time.sleep(min(.2, max(.001, (release-now()).total_seconds())))
         try:
-            book(cfg, runtime, date, prepared=prepared)
+            while now() < release:
+                time.sleep(min(.2, max(.001, (release-now()).total_seconds())))
+            booking_prepared, prepared = prepared, None  # 连接的关闭责任转交 book。
+            book(cfg, runtime, date, prepared=booking_prepared, release=release)
         except Exception as exc:
             LOG.error("本周预约结束：%s", safe_message(exc))
             notify()
+        finally:
+            if prepared:
+                close_clients(prepared["clients"])
         # 本周无论成功或失败都不在同一放号时刻反复启动。
         next_week = release+dt.timedelta(days=7)
         while now() < next_week-dt.timedelta(seconds=cfg["warmup_seconds"]):
@@ -656,7 +873,11 @@ def main(argv=None):
         if args.command == "refresh-session": refresh_session(cfg, runtime)
         elif args.command == "check":
             session = load_session(runtime)
-            names = probe(Client(session, cfg), cfg)
+            client = Client(session, cfg)
+            try:
+                names = probe(client, cfg)
+            finally:
+                client.close()
             LOG.info("站点会话读取有效：%s；不代表已验证会员下单权限。", "、".join(names.values()))
         elif args.command in ("book", "dry-run"):
             if args.date is None: raise BookingError("book/dry-run 需要明确提供 --date YYYY-MM-DD")
