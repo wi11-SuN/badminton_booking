@@ -3,6 +3,7 @@
   "venue_name": "综合馆",
   "service_id": "1002",
   "field_type_priority": ["2434", "842"],
+  "court_count": 1,
   "anchor_court": {"field_type": "2434", "field_id": "20009846", "name": "一楼10米训练25"},
   "start_time": "19:00",
   "end_time": "21:00",
