@@ -63,7 +63,7 @@ class AnchorPreviewTests(unittest.TestCase):
              patch.object(booking, "prepare", return_value=self.prepared), \
              patch.object(booking, "book", side_effect=intercept_book):
             with self.assertRaises(KeyboardInterrupt):
-                booking.schedule(cfg, None)
+                booking.weekly_bookings(cfg, None)
         scan.assert_called_once_with(self.preview_client, cfg, self.date, "2434")
         self.factory.assert_called_once_with({"cookies": self.primary.cookies}, cfg)
         self.assertTrue(self.preview_client.closed.is_set())

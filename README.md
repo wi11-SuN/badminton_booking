@@ -7,7 +7,7 @@
 1. 在 Windows 11 上安装 Python 3.10 或更新版本、电脑微信和 Reqable。脚本仅依赖 Python 标准库。在项目目录打开 PowerShell，运行 `py --version` 确认解释器版本。
 2. 打开 [config.json](config.json)，将 `reqable_mcp_path` 改为本机 Reqable 安装目录中的 `mcp-server.exe` 路径。JSON 字符串中的反斜杠要写成 `\\`。
 3. 在 Reqable 开启「API 服务」并开始抓包。用自己的电脑微信登录「宁波奥体中心」，依次进入「场馆业务」→「在线营业厅」→「羽毛球」，让 Reqable 留下新的 `webssl.xports.cn` 访问记录。
-4. 在项目目录执行以下两条命令。第一条会提示输入 Reqable API 令牌，输入时不回显。脚本从抓包记录读取场馆会话，验证成功后保存到本机。第二条检查这个会话能否读取场馆信息。会员下单权限由场馆在实际提交时校验。
+4. 在项目目录执行以下两条命令。第一条会提示输入 Reqable API 令牌，输入时不回显。脚本从抓包记录读取场馆会话，验证成功后保存到本机。第二条检查能否读取场馆信息和会员的「我的订单」页面。下单权限由场馆在提交时校验。
 
    ```powershell
    py book_badminton.py refresh-session
@@ -53,11 +53,72 @@ py book_badminton.py book --date $bookingDate --court-count 2
 | --- | --- |
 | `plan` | 显示下次放号及目标日期。省略子命令也会显示计划。 |
 | `refresh-session` | 从 Reqable 更新本人登录会话。也支持通过 `REQABLE_TOKEN` 环境变量提供令牌。 |
-| `check` | 验证本机会话可读取场馆信息。 |
+| `check` | 验证当前会话可读取场馆信息和会员订单页。 |
+| `test-email` | 按当前 SMTP 配置向失效提醒收件人发送一封测试邮件。 |
 | `dry-run --date YYYY-MM-DD` | 只读预览指定日期的场地组合。 |
 | `book --date YYYY-MM-DD` | 立即尝试预约指定日期，执行一轮后退出。 |
-| `schedule` | 等待每周放号并尝试预约，结束本轮后继续等下周。 |
+| `schedule` | 每三分钟检查会员订单页，每周按计划尝试预约。 |
 | `status` | 查看本机最近的提交记录，最新支付或取消状态以手机订单为准。 |
+
+## Linux 常驻与会话失效邮件
+
+`schedule` 启动时检查一次「我的订单」，此后每 180 秒在后台检查。场馆若按访问时间延长会员会话，这些请求可以帮助续期。会话的最长有效期由场馆决定。
+
+保活查询确认登录失效时，脚本向 `config.json` 中的 `session_alert_email`（当前为 `1160389221@qq.com`）发邮件。同一份凭证持续失效期间，邮件服务器接受一封提醒后就停止重复提醒，投递失败将在后续周期重试。网络超时、限流或页面无法识别时，脚本记录错误并在下一周期继续检查。
+
+若预约提交被场馆以会员登录业务码 `404` 拒绝，调度器也会在下一次检查时提醒，并等待读取新上传的凭证。
+
+1. **部署文件。** 在服务器的 `~/badminton_booking/` 放置 `book_badminton.py`、`booking_mail.py` 和 `config.json`。以将来运行服务的 Linux 用户执行以下命令。通过 SSH 将 Windows 生成的 `session.json` 上传为运行目录中的 `session.json.new`，传完再重命名。
+
+   ```bash
+   install -d -m 700 ~/.local/state/badminton-booking ~/.config/badminton-booking
+   # 上传完成后执行
+   chmod 600 ~/.local/state/badminton-booking/session.json.new
+   mv ~/.local/state/badminton-booking/{session.json.new,session.json}
+   ```
+
+2. **配置发件邮箱。** 在服务器上以运行用户创建 `~/.config/badminton-booking/mail.env`，执行 `chmod 600 ~/.config/badminton-booking/mail.env`。若使用 QQ 邮箱发件，先在该邮箱开启 SMTP 并生成授权码，然后将以下占位值替换为发件人的实际信息。发件邮箱可以与收件邮箱相同。
+
+   ```ini
+   BOOKING_SMTP_HOST=smtp.qq.com
+   BOOKING_SMTP_PORT=465
+   BOOKING_SMTP_USER=你的发件邮箱@qq.com
+   BOOKING_SMTP_PASSWORD=发件邮箱的SMTP授权码
+   ```
+
+   `BOOKING_SMTP_SECURITY` 默认取 `ssl`。若发件服务商要求 STARTTLS，设为 `starttls` 并填写该服务商的端口。`BOOKING_SMTP_FROM` 可选，默认用 `BOOKING_SMTP_USER` 作为发件地址。
+
+3. **从服务器验证。** 使用同一账号在服务器执行以下命令，并确认收件箱收到测试邮件。
+
+   ```bash
+   cd ~/badminton_booking
+   set -a
+   . ~/.config/badminton-booking/mail.env
+   set +a
+   python3 book_badminton.py check --runtime-dir ~/.local/state/badminton-booking
+   python3 book_badminton.py test-email --runtime-dir ~/.local/state/badminton-booking
+   ```
+
+4. **启动常驻服务。** 以 systemd 用户服务为例，创建 `~/.config/systemd/user/badminton-booking.service`。若 Python 或脚本安装在其他位置，按实际路径调整 `ExecStart`。
+
+   ```ini
+   [Unit]
+   Description=Badminton booking
+
+   [Service]
+   EnvironmentFile=%h/.config/badminton-booking/mail.env
+   UMask=0077
+   ExecStart=/usr/bin/python3 %h/badminton_booking/book_badminton.py schedule --runtime-dir %h/.local/state/badminton-booking
+   Restart=on-failure
+   RestartSec=10
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   运行 `systemctl --user daemon-reload` 和 `systemctl --user enable --now badminton-booking.service`。要在用户退出或服务器重启后继续运行，启用 `loginctl enable-linger "$USER"`。如已有托管此脚本的服务，将环境文件配置到原服务后重启，只运行一份 `schedule`。
+
+收到失效提醒后，在 Windows 微信重新登录并运行 `refresh-session`，按第 1 步替换服务器上的 `session.json`，再运行服务器端的 `check`。常驻进程在后续检查时会读到新凭证。保活查询成功后换发的 Cookie 会存入同目录的 `session-cookies.json`，供匹配原始会话的后续检查和预约使用。两个 JSON 文件都含登录凭证，保存在权限为 `700` 的运行目录中。
 
 ## 如何选场
 
@@ -95,7 +156,7 @@ flowchart TD
 ```
 
 - **一楼查询仍在进行时**，双场首单会等本轮一楼结果。即使上一轮返回零组、这一轮三楼先查到了组合，也会给正在查询的一楼首选机会。场馆要求的倒计时可能使候选过期，此时会重新查询。
-- **后台线程只查库存**。下单统一由主线程串行发送。只有场馆明确返回库存冲突时才会换组合。首单和备选共用最多 3 次提交。若 25＋26 冲突，且 24＋27 可订，脚本会优先使用后者，减少复用可能已被占用的场地。
+- **下单统一由主线程串行发送**。只有场馆明确返回库存冲突时才会换组合。首单和备选共用最多 3 次提交。若 25＋26 冲突，且 24＋27 可订，脚本会优先使用后者，减少复用可能已被占用的场地。
 - **提交前先写本机记录**。相同场馆、日期和时段已有提交记录时，新的运行会停止，以免重复创建订单。
 
 ## 常用配置
@@ -114,7 +175,7 @@ flowchart TD
 
 ## 查单与排查
 
-默认运行目录是 `%LOCALAPPDATA%\BadmintonBooking`。`session.json` 包含本人的场馆登录凭证，应保存在本机并排除在 Git 提交之外。`booking.log` 可查看查询、选场和提交的时间线。`orders` 中的 JSON 记录每笔尝试、场号、服务器返回的订单号及付款信息。
+默认运行目录在 Windows 上是 `%LOCALAPPDATA%\BadmintonBooking`，在 Linux 上是 `${XDG_STATE_HOME:-$HOME/.local/state}/badminton-booking`。`booking.log` 可查看查询、选场和提交的时间线。`orders` 中的 JSON 记录每笔尝试、场号、服务器返回的订单号及付款信息。
 
 | 现象 | 如何处理 |
 | --- | --- |

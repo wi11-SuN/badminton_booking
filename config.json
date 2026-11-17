@@ -17,6 +17,7 @@
   "max_wait_seconds": 30,
   "max_commit_attempts": 3,
   "http_timeout_seconds": 8,
+  "session_alert_email": "1160389221@qq.com",
   "runtime_dir": null,
   "reqable_mcp_path": "D:\\Reqable\\mcp-server.exe"
 }

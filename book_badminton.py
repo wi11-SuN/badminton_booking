@@ -8,6 +8,7 @@ import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import getpass
+import hashlib
 from html import unescape
 from html.parser import HTMLParser
 import http.client
@@ -21,9 +22,12 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+
+from booking_mail import send_expiration_email, send_test_email, validate_smtp_settings
 
 TZ = dt.timezone(dt.timedelta(hours=8), "Asia/Shanghai")
 ORIGIN = "https://webssl.xports.cn"
@@ -32,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 LOG = logging.getLogger("booking")
 TEN_METRE = "2434"
 TRAINING_PAIR = ("20009846", "20009847")  # 一楼10米训练25、26
+KEEPALIVE_SECONDS = 180
 
 
 class BookingError(Exception): pass
@@ -55,9 +60,13 @@ def safe_message(value):
 def atomic_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 def half_hour(value):
@@ -155,7 +164,7 @@ class Client:
             self._closed = True
             self._disconnect()
 
-    def request(self, path, payload=None, referer=None):
+    def request(self, path, payload=None, referer=None, *, document=False):
         if not path.startswith(ROOT + "/") or "\r" in path or "\n" in path:
             raise BookingError("拒绝非场馆路径")
         if referer is not None and (not referer.startswith(ROOT + "/") or "\r" in referer or "\n" in referer):
@@ -176,9 +185,13 @@ class Client:
                             # 固定 HTTPS 主机；不读取环境代理，也不自动跟随重定向。
                             self._connection = http.client.HTTPSConnection(origin.hostname, origin.port, timeout=self.timeout)
                         headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in self.cookies.items()),
-                                   "User-Agent": self.agent, "Accept": "application/json,text/html;q=0.9",
-                                   "X-Requested-With": "XMLHttpRequest",
+                                   "User-Agent": self.agent,
                                    "Referer": ORIGIN + (referer or ROOT+"/venue/venueQueryList?key=&serviceId=1002")}
+                        if document:
+                            headers["Accept"] = "text/html,application/xhtml+xml,*/*;q=0.8"
+                        else:
+                            headers.update({"Accept": "application/json,text/html;q=0.9",
+                                            "X-Requested-With": "XMLHttpRequest"})
                         if payload is not None:
                             headers.update({"Content-Type": "application/json", "Origin": ORIGIN})
                         self._connection.request(method, path, body=data, headers=headers)
@@ -365,15 +378,37 @@ def court_groups(choices, kind, count):
     return (tuple(preferred) + extra for extra in combinations(extras, count-2))
 
 
-def load_session(runtime):
+def optional_state(path):
+    try:
+        data = json.loads(path.read_bytes())
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        LOG.warning("忽略无法解析的状态文件 %s", path.name)
+        return {}
+
+
+def session_snapshot(runtime):
     path = runtime/"session.json"
-    if not path.exists():
-        raise SessionExpired("没有本地会话，请先运行 refresh-session")
-    session = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise SessionExpired("没有本地会话，请先运行 refresh-session") from None
+    session = json.loads(raw)
+    source = hashlib.sha256(raw).hexdigest()
+    cached = optional_state(runtime/"session-cookies.json")
+    if cached.get("source") == source and isinstance(cached.get("cookies"), dict):
+        session["cookies"] = cached["cookies"]
     cookies = session.get("cookies", {})
     if not cookies.get("JSESSIONID") or any("\r" in str(v) or "\n" in str(v) for v in cookies.values()):
         raise SessionExpired("会话文件格式不正确，请 refresh-session")
-    return session
+    return source, session
+
+
+def load_session(runtime):
+    source, session = session_snapshot(runtime)
+    return dict(session, source=source)
 
 
 def probe(client, cfg):
@@ -384,6 +419,46 @@ def probe(client, cfg):
     if not configured:
         raise BookingError("没有找到配置中的场地类型，请核对场馆配置")
     return configured
+
+
+class _MemberOrderPage(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self.missing_wechat = False
+        self._section = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("title", "script", "style"):
+            self._section = tag
+
+    def handle_endtag(self, tag):
+        if tag == self._section:
+            self._section = None
+
+    def handle_data(self, data):
+        if self._section == "title":
+            self.title += data
+        elif self._section is None and "未查询到公众号信息" in data:
+            self.missing_wechat = True
+
+
+def member_session_probe(client):
+    """读取会员订单页，只识别登录状态，不保存订单内容。"""
+    status, body = client.request(ROOT+"/order/query", referer=ROOT+"/member/homePage", document=True)
+    if status == 401:
+        raise SessionExpired("订单页要求登录（HTTP 401）")
+    if status != 200:
+        raise BookingError(f"无法确认会员会话：订单页 HTTP {status}")
+    page = _MemberOrderPage()
+    page.feed(body)
+    page.close()
+    title = page.title.strip()
+    if title == "我的订单":
+        return
+    if title in ("登录", "会员登录", "用户登录") or (title == "失败" and page.missing_wechat):
+        raise SessionExpired("订单页要求重新登录，请更新场馆会话")
+    raise BookingError("无法确认会员会话：订单页返回了未识别的页面")
 
 
 def court_path(cfg, kind, date):
@@ -864,6 +939,12 @@ def book(cfg, runtime, date, dry=False, prepared=None, release=None, prepared_an
                 notify()
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return result
+            except SessionExpired:
+                # commit_once 只在场馆明确返回会员登录业务码 404 时抛出此错误。
+                source = prepared.get("session", {}).get("source")
+                if source:
+                    atomic_json(runtime/"booking-login-required.json", {"source": source})
+                raise
             except NotAvailable as exc:
                 LOG.warning("%s", safe_message(exc))
                 if len(journal["attempts"]) >= cfg["max_commit_attempts"]:
@@ -1046,7 +1127,84 @@ def anchor_at_release(cfg, prepared, date, release):
             client.close()
 
 
+def check_member(cfg, runtime, source, session, check_venue=False):
+    client = Client(session, cfg)
+    try:
+        member_session_probe(client)
+        names = probe(client, cfg) if check_venue else None
+        if client.cookies != session["cookies"]:
+            # 避免慢响应替换请求途中上传的凭证或者另一次检查已保存的新 Cookie。
+            current_source, current = session_snapshot(runtime)
+            if current_source == source and current["cookies"] == session["cookies"]:
+                atomic_json(runtime/"session-cookies.json", {"source": source, "cookies": client.cookies})
+        return names
+    finally:
+        client.close()
+
+
+def alert_expired_session(cfg, runtime, source):
+    alert_path = runtime/"session-alert.json"
+    recipient = cfg.get("session_alert_email")
+    if not recipient:
+        LOG.error("会员登录已失效，未配置 session_alert_email。")
+        return
+    receipt = {"source": source, "recipient": recipient}
+    if optional_state(alert_path) == receipt:
+        return
+    if source != session_snapshot(runtime)[0]:
+        return  # 旧请求返回前，用户已上传另一份凭证。
+    LOG.error("场馆要求重新登录会员，正在发送邮件。")
+    send_expiration_email(recipient, now())
+    atomic_json(alert_path, receipt)
+    LOG.info("登录失效提醒已交给邮件服务器。")
+
+
+def keepalive_once(cfg, runtime):
+    source, session = session_snapshot(runtime)
+    # 即使还能查订单，场馆明确拒绝该会话下单时也需要换凭证。
+    if optional_state(runtime/"booking-login-required.json").get("source") == source:
+        alert_expired_session(cfg, runtime, source)
+        return
+    try:
+        check_member(cfg, runtime, source, session)
+    except SessionExpired:
+        alert_expired_session(cfg, runtime, source)
+    else:
+        (runtime/"session-alert.json").unlink(missing_ok=True)
+        LOG.info("保活检查通过：会员订单页可读取。")
+
+
+def keepalive_loop(cfg, runtime, stop):
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            keepalive_once(cfg, runtime)
+        except Exception as exc:
+            LOG.warning("保活检查或邮件投递未完成，下轮重试：%s", safe_message(exc))
+        stop.wait(max(0, KEEPALIVE_SECONDS - (time.monotonic() - started)))
+
+
 def schedule(cfg, runtime):
+    recipient = cfg.get("session_alert_email")
+    if recipient:
+        try:
+            validate_smtp_settings(recipient)
+        except Exception as exc:
+            LOG.warning("失效邮件尚未就绪：%s", safe_message(exc))
+    else:
+        LOG.warning("未设置 session_alert_email，登录失效时仅写日志。")
+    stop = threading.Event()
+    worker = threading.Thread(target=keepalive_loop, args=(cfg, runtime, stop),
+                              name="member-keepalive", daemon=True)
+    worker.start()
+    try:
+        weekly_bookings(cfg, runtime)
+    finally:
+        stop.set()
+        worker.join(timeout=1)
+
+
+def weekly_bookings(cfg, runtime):
     LOG.info("定时预约已启动；保持电脑开机、联网，按 Ctrl+C 退出。")
     while True:
         release = next_release(now(), cfg)
@@ -1090,7 +1248,7 @@ def status(runtime):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="plan", choices=["plan", "refresh-session", "check", "dry-run", "book", "schedule", "status"])
+    parser.add_argument("command", nargs="?", default="plan", choices=["plan", "refresh-session", "check", "test-email", "dry-run", "book", "schedule", "status"])
     parser.add_argument("--config", default=str(HERE/"config.json"))
     parser.add_argument("--runtime-dir", help="本地会话、日志及防重复记录目录")
     parser.add_argument("--date", type=dt.date.fromisoformat, help="dry-run/book 的明确目标日期 YYYY-MM-DD")
@@ -1112,13 +1270,14 @@ def main(argv=None):
     try:
         if args.command == "refresh-session": refresh_session(cfg, runtime)
         elif args.command == "check":
-            session = load_session(runtime)
-            client = Client(session, cfg)
-            try:
-                names = probe(client, cfg)
-            finally:
-                client.close()
-            LOG.info("站点会话读取有效：%s；不代表已验证会员下单权限。", "、".join(names.values()))
+            source, session = session_snapshot(runtime)
+            names = check_member(cfg, runtime, source, session, check_venue=True)
+            LOG.info("会员订单页及场地读取有效：%s。", "、".join(names.values()))
+        elif args.command == "test-email":
+            if not cfg.get("session_alert_email"):
+                raise BookingError("请设置 session_alert_email 收件地址。")
+            send_test_email(cfg["session_alert_email"])
+            LOG.info("测试邮件已交给邮件服务器，请检查收件箱。")
         elif args.command in ("book", "dry-run"):
             if args.date is None: raise BookingError("book/dry-run 需要明确提供 --date YYYY-MM-DD")
             if args.date < now().date(): raise BookingError("不接受已过去的日期")
